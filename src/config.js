@@ -39,4 +39,16 @@ function loadConfig(configPath) {
   return config;
 }
 
-module.exports = { loadConfig, DEFAULT_CONFIG };
+/**
+ * Validates that a port number is within the valid TCP range.
+ * Throws an error if the port is invalid.
+ */
+function validatePort(port) {
+  const num = Number(port);
+  if (!Number.isInteger(num) || num < 1 || num > 65535) {
+    throw new Error(`Invalid port: ${port}. Must be an integer between 1 and 65535`);
+  }
+  return num;
+}
+
+module.exports = { loadConfig, validatePort, DEFAULT_CONFIG };
