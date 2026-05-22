@@ -1,0 +1,22 @@
+{
+  "port": 9000,
+  "secret": "your-github-webhook-secret",
+  "hooks": [
+    {
+      "repo": "myorg/myapp",
+      "branch": "main",
+      "script": "./scripts/deploy-myapp.sh",
+      "cwd": "/opt/myapp"
+    },
+    {
+      "repo": "myorg/backend",
+      "branch": "production",
+      "script": "./scripts/deploy-backend.sh"
+    },
+    {
+      "repo": "myorg/frontend",
+      "script": "./scripts/deploy-frontend.sh",
+      "cwd": "/var/www/frontend"
+    }
+  ]
+}

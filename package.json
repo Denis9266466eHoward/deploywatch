@@ -1,0 +1,22 @@
+{
+  "name": "deploywatch",
+  "version": "0.1.0",
+  "description": "Minimal webhook listener that triggers shell scripts on GitHub push events with configurable filters",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch"
+  },
+  "keywords": ["webhook", "github", "deploy", "ci", "automation"],
+  "license": "MIT",
+  "dependencies": {
+  },
+  "devDependencies": {
+    "jest": "^29.0.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": ["**/*.test.js"]
+  }
+}
