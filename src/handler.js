@@ -2,83 +2,71 @@
 
 const { verifySignature } = require("./signature");
 const { matchesFilters, extractContext } = require("./filters");
-const { createQueue } = require("./queue");
+const { runOnce, buildEnv } = require("./runner");
 const { createRateLimiter } = require("./ratelimit");
+const { enqueue } = require("./queue");
 const { increment } = require("./metrics");
+const { record } = require("./audit");
 const { log } = require("./logger");
 
-function createHandler(config, runner) {
-  const queue = createQueue(runner, { concurrency: config.concurrency || 1 });
-  const limiter = config.rateLimit
-    ? createRateLimiter(config.rateLimit)
-    : null;
+function createHandler(config, queue) {
+  const limiter = createRateLimiter({ windowMs: 60000, max: config.rateLimit || 30 });
 
   return async function handler(req, res) {
-    increment("requests");
+    const ip = req.socket.remoteAddress || "unknown";
 
     if (req.method !== "POST") {
-      res.writeHead(405, { "Content-Type": "text/plain" });
-      res.end("Method Not Allowed");
+      res.writeHead(405).end("Method Not Allowed");
       return;
     }
 
-    let body = "";
-    for await (const chunk of req) {
-      body += chunk;
-      if (body.length > 1024 * 512) {
-        res.writeHead(413, { "Content-Type": "text/plain" });
-        res.end("Payload Too Large");
-        increment("rejected");
-        return;
-      }
+    if (!limiter.check(ip)) {
+      increment("webhook.rate_limited");
+      record({ type: "webhook", ip, status: "rate_limited" });
+      res.writeHead(429).end("Too Many Requests");
+      return;
     }
 
-    if (config.secret) {
-      const sig = req.headers["x-hub-signature-256"] || "";
-      if (!verifySignature(body, config.secret, sig)) {
-        log("warn", "signature verification failed");
-        increment("rejected");
-        res.writeHead(401, { "Content-Type": "text/plain" });
-        res.end("Unauthorized");
-        return;
-      }
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    await new Promise((r) => req.on("end", r));
+    const rawBody = Buffer.concat(chunks);
+
+    const sig = req.headers["x-hub-signature-256"];
+    if (!verifySignature(rawBody, sig, config.secret)) {
+      increment("webhook.invalid_signature");
+      record({ type: "webhook", ip, status: "invalid_signature" });
+      res.writeHead(401).end("Unauthorized");
+      return;
     }
 
     let payload;
     try {
-      payload = JSON.parse(body);
+      payload = JSON.parse(rawBody.toString());
     } catch {
-      increment("rejected");
-      res.writeHead(400, { "Content-Type": "text/plain" });
-      res.end("Bad Request");
+      res.writeHead(400).end("Bad Request");
       return;
     }
 
     const ctx = extractContext(payload);
 
-    if (limiter && !limiter.check(ctx.repo || "global")) {
-      log("warn", `rate limit hit for ${ctx.repo}`);
-      increment("rateLimited");
-      increment("rejected");
-      res.writeHead(429, { "Content-Type": "text/plain" });
-      res.end("Too Many Requests");
-      return;
+    for (const hook of config.hooks || []) {
+      if (!matchesFilters(payload, hook.filters || {})) continue;
+
+      const env = buildEnv(ctx);
+      const task = () =>
+        runOnce(hook.script, env).then((result) => {
+          const status = result.code === 0 ? "ok" : "error";
+          increment(status === "ok" ? "hook.success" : "hook.error");
+          record({ type: "deploy", repo: ctx.repo, ref: ctx.ref, ip, status, detail: hook.script });
+          log("info", `hook ${hook.script} exited ${result.code} for ${ctx.repo}`);
+        });
+
+      enqueue(queue, task);
+      increment("webhook.accepted");
     }
 
-    if (!matchesFilters(payload, config.filters || {})) {
-      log("info", `filters did not match for ${ctx.repo}/${ctx.branch}`);
-      increment("rejected");
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("Ignored");
-      return;
-    }
-
-    increment("accepted");
-    log("info", `queuing script for ${ctx.repo}/${ctx.branch}`);
-    queue.enqueue(ctx);
-
-    res.writeHead(202, { "Content-Type": "text/plain" });
-    res.end("Accepted");
+    res.writeHead(200).end("OK");
   };
 }
 
