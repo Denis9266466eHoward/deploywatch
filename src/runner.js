@@ -1,61 +1,63 @@
-const { spawn } = require('child_process');
+"use strict";
 
-/**
- * Run a shell script, passing context as environment variables.
- * @param {string} scriptPath - Path to the script to execute
- * @param {Object} context - Key/value pairs to inject as env vars
- * @param {Function} logger - Optional logging function
- * @returns {Promise<{code: number, stdout: string, stderr: string}>}
- */
-function runScript(scriptPath, context = {}, logger = console.log) {
+// Runs a configured deploy script as a child process
+// Supports retry via createRetry and captures stdout/stderr
+
+const { spawn } = require("child_process");
+const { log } = require("./logger");
+const { createRetry } = require("./retry");
+
+function buildEnv(context) {
+  return {
+    ...process.env,
+    DEPLOY_REPO: context.repo ?? "",
+    DEPLOY_BRANCH: context.branch ?? "",
+    DEPLOY_PUSHER: context.pusher ?? "",
+    DEPLOY_COMMIT: context.commit ?? "",
+    DEPLOY_REF: context.ref ?? "",
+  };
+}
+
+function runOnce(script, env) {
   return new Promise((resolve, reject) => {
-    const env = buildEnv(context);
+    const proc = spawn("sh", ["-c", script], { env, timeout: 60000 });
+    const out = [];
+    const err = [];
 
-    logger(`[runner] executing: ${scriptPath}`);
+    proc.stdout.on("data", (d) => out.push(d));
+    proc.stderr.on("data", (d) => err.push(d));
 
-    const child = spawn('sh', [scriptPath], {
-      env,
-      timeout: 60000,
-    });
-
-    let stdout = '';
-    let stderr = '';
-
-    child.stdout.on('data', (data) => {
-      stdout += data.toString();
-    });
-
-    child.stderr.on('data', (data) => {
-      stderr += data.toString();
-    });
-
-    child.on('error', (err) => {
-      reject(new Error(`Failed to start script: ${err.message}`));
-    });
-
-    child.on('close', (code) => {
-      logger(`[runner] script exited with code ${code}`);
-      if (code !== 0) {
-        logger(`[runner] stderr: ${stderr.trim()}`);
+    proc.on("close", (code) => {
+      const stdout = Buffer.concat(out).toString().trim();
+      const stderr = Buffer.concat(err).toString().trim();
+      if (code === 0) {
+        resolve({ code, stdout, stderr });
+      } else {
+        const error = new Error(`script exited with code ${code}`);
+        error.code = code;
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
       }
-      resolve({ code, stdout, stderr });
     });
+
+    proc.on("error", reject);
   });
 }
 
-/**
- * Build environment variables from context, prefixed with DW_.
- * @param {Object} context
- * @returns {Object}
- */
-function buildEnv(context) {
-  const env = { ...process.env };
-  for (const [key, value] of Object.entries(context)) {
-    if (value !== null && value !== undefined) {
-      env[`DW_${key.toUpperCase()}`] = String(value);
-    }
-  }
-  return env;
+async function runScript(script, context, retryOptions = {}) {
+  const env = buildEnv(context);
+  const { withRetry } = createRetry(retryOptions);
+  const label = { script, repo: context.repo, branch: context.branch };
+
+  log("info", "running script", label);
+
+  const result = await withRetry(async () => {
+    return runOnce(script, env);
+  }, label);
+
+  log("info", "script completed", { ...label, stdout: result.stdout });
+  return result;
 }
 
 module.exports = { runScript, buildEnv };
