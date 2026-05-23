@@ -1,62 +1,53 @@
-import http from 'http';
-import { loadConfig } from './config.js';
-import { createHandler } from './handler.js';
+"use strict";
 
-let server = null;
+const http = require("http");
+const { createHandler } = require("./handler");
+const { createHealthHandler } = require("./healthcheck");
+const { log } = require("./logger");
 
-export function createServer(config) {
-  const handler = createHandler(config);
+/**
+ * Creates and starts an HTTP server that routes:
+ *   POST /webhook  -> deploywatch handler
+ *   GET  /healthz  -> health check
+ * @param {object} config
+ * @returns {http.Server}
+ */
+function createServer(config) {
+  const webhookHandler = createHandler(config);
+  const healthHandler = createHealthHandler(config);
 
-  server = http.createServer((req, res) => {
-    const { method, url } = req;
-    const listenPath = config.path || '/webhook';
-
-    if (method !== 'POST' || url !== listenPath) {
-      res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end('Not Found');
-      return;
+  const server = http.createServer((req, res) => {
+    if (req.method === "POST" && req.url === "/webhook") {
+      webhookHandler(req, res);
+    } else if (req.method === "GET" && req.url === "/healthz") {
+      healthHandler(req, res);
+    } else {
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("Not Found");
     }
+  });
 
-    let body = '';
-    req.on('data', (chunk) => {
-      body += chunk.toString();
-      if (body.length > 1e6) {
-        res.writeHead(413, { 'Content-Type': 'text/plain' });
-        res.end('Payload Too Large');
-        req.destroy();
-      }
-    });
-
-    req.on('end', () => {
-      handler(req, res, body);
-    });
-
-    req.on('error', (err) => {
-      console.error('[deploywatch] request error:', err.message);
-      res.writeHead(400, { 'Content-Type': 'text/plain' });
-      res.end('Bad Request');
-    });
+  const port = config.port || 9000;
+  server.listen(port, () => {
+    log("info", `deploywatch listening on port ${port}`);
   });
 
   return server;
 }
 
-export async function start(configPath) {
-  const config = await loadConfig(configPath);
-  const port = config.port || 9000;
-  const srv = createServer(config);
-
-  srv.listen(port, () => {
-    console.log(`[deploywatch] listening on port ${port}`);
+/**
+ * Gracefully shuts down the server.
+ * @param {http.Server} server
+ * @returns {Promise<void>}
+ */
+function shutdown(server) {
+  return new Promise((resolve, reject) => {
+    log("info", "shutting down server");
+    server.close((err) => {
+      if (err) reject(err);
+      else resolve();
+    });
   });
-
-  process.on('SIGTERM', () => shutdown(srv));
-  process.on('SIGINT', () => shutdown(srv));
-
-  return srv;
 }
 
-function shutdown(srv) {
-  console.log('[deploywatch] shutting down...');
-  srv.close(() => process.exit(0));
-}
+module.exports = { createServer, shutdown };
