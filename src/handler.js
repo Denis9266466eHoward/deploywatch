@@ -1,67 +1,74 @@
-const { verifySignature } = require('./signature');
-const { matchesFilters, extractContext } = require('./filters');
-const { runScript } = require('./runner');
+"use strict";
 
-/**
- * Create an HTTP request handler for GitHub push webhooks.
- * @param {Object} config - Loaded deploywatch config
- * @param {Function} logger
- * @returns {Function} Node.js http request handler
- */
-function createHandler(config, logger = console.log) {
-  return async function handler(req, res) {
-    if (req.method !== 'POST') {
-      res.writeHead(405, { 'Content-Type': 'text/plain' });
-      return res.end('Method Not Allowed');
-    }
+const { verifySignature } = require("./signature");
+const { matchesFilters, extractContext } = require("./filters");
+const { runScript } = require("./runner");
+const { createQueue } = require("./queue");
+const { log } = require("./logger");
 
-    let body = '';
-    req.on('data', (chunk) => { body += chunk; });
+const queue = createQueue();
 
-    req.on('end', async () => {
-      // Verify signature if secret is configured
+function createHandler(config) {
+  return function handler(req, res) {
+    let body = "";
+
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 1e6) {
+        body = "";
+        res.writeHead(413);
+        res.end("payload too large");
+        req.destroy();
+      }
+    });
+
+    req.on("end", () => {
+      const sig = req.headers["x-hub-signature-256"];
+
       if (config.secret) {
-        const sig = req.headers['x-hub-signature-256'] || '';
-        if (!verifySignature(body, config.secret, sig)) {
-          logger('[handler] invalid signature');
-          res.writeHead(401, { 'Content-Type': 'text/plain' });
-          return res.end('Unauthorized');
+        if (!sig || !verifySignature(body, config.secret, sig)) {
+          log("warn", "signature verification failed");
+          res.writeHead(401);
+          res.end("unauthorized");
+          return;
         }
       }
 
       let payload;
       try {
         payload = JSON.parse(body);
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'text/plain' });
-        return res.end('Bad Request: invalid JSON');
+      } catch {
+        res.writeHead(400);
+        res.end("invalid json");
+        return;
       }
 
-      // Only handle push events
-      const event = req.headers['x-github-event'];
-      if (event !== 'push') {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        return res.end('ignored');
+      const event = req.headers["x-github-event"] || "push";
+      if (event !== "push") {
+        res.writeHead(200);
+        res.end("ignored");
+        return;
       }
 
-      const filters = config.filters || {};
-      if (!matchesFilters(payload, filters)) {
-        logger('[handler] push event did not match filters, skipping');
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        return res.end('filtered');
+      const ctx = extractContext(payload);
+
+      const matched = (config.hooks || []).filter((hook) =>
+        matchesFilters(hook.filters || {}, ctx)
+      );
+
+      if (matched.length === 0) {
+        log("info", `no hooks matched for ref=${ctx.ref} repo=${ctx.repo}`);
+        res.writeHead(200);
+        res.end("no match");
+        return;
       }
 
-      const context = extractContext(payload);
-      logger(`[handler] matched push on ${context.branch} — running script`);
+      res.writeHead(202);
+      res.end("accepted");
 
-      try {
-        const result = await runScript(config.script, context, logger);
-        res.writeHead(result.code === 0 ? 200 : 500, { 'Content-Type': 'text/plain' });
-        res.end(result.code === 0 ? 'ok' : 'script failed');
-      } catch (err) {
-        logger(`[handler] error running script: ${err.message}`);
-        res.writeHead(500, { 'Content-Type': 'text/plain' });
-        res.end('Internal Server Error');
+      for (const hook of matched) {
+        const queueKey = hook.script;
+        queue.enqueue(queueKey, () => runScript(hook.script, ctx));
       }
     });
   };
